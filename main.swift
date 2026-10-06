@@ -324,10 +324,7 @@ final class Store: ObservableObject {
         guard target != cur, busy == nil else { return }
         busy = "Quitting Claude…"
         defer { busy = nil }
-        let running = { NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) }
-        running().forEach { $0.terminate() }
-        for _ in 0..<60 where !running().isEmpty { try? await Task.sleep(nanoseconds: 250_000_000) }
-        guard running().isEmpty else {
+        guard await quitClaude() else {
             banner = "Claude didn't quit. Close it manually, then switch again."
             return
         }
@@ -349,12 +346,111 @@ final class Store: ObservableObject {
             return
         }
         busy = "Opening Claude…"
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: .init())
-        }
+        await launchClaude()
         reloadList()
         await refresh()
     }
+
+    /// Copies threads into another profile. If that profile is live and Claude is running,
+    /// Claude is restarted so it picks the new threads up.
+    func copyThreads(_ threads: [ThreadInfo], to target: String) async -> String {
+        guard busy == nil else { return "Busy, try again in a moment." }
+        let restart = target == currentProfile()
+            && !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+        if restart {
+            busy = "Quitting Claude…"
+            guard await quitClaude() else { busy = nil; return "Claude didn't quit. Close it manually and try again." }
+        }
+        busy = "Copying \(threads.count) threads…"
+        let result: String
+        do {
+            let (copied, skipped) = try copyThreadFiles(threads, to: profileDir(target))
+            result = "Copied \(copied) thread\(copied == 1 ? "" : "s") to \(target)"
+                + (skipped > 0 ? " (\(skipped) already there)" : "") + "."
+        } catch { result = "Copy failed: \(error.localizedDescription)" }
+        if restart { busy = "Opening Claude…"; await launchClaude() }
+        busy = nil
+        reloadList()
+        return result
+    }
+}
+
+func quitClaude() async -> Bool {
+    let running = { NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) }
+    running().forEach { $0.terminate() }
+    for _ in 0..<60 where !running().isEmpty { try? await Task.sleep(nanoseconds: 250_000_000) }
+    return running().isEmpty
+}
+
+func launchClaude() async {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: .init())
+    }
+}
+
+// MARK: - Claude Code threads
+//
+// Each desktop Code thread is one JSON file in <profile>/claude-code-sessions/<account>/<org>/.
+// The conversation itself lives in the shared ~/.claude/projects, so copying the JSON is enough
+// for another account to resume it.
+
+struct ThreadInfo: Identifiable, Hashable {
+    var id: String { file.lastPathComponent }
+    let file: URL
+    let title: String
+    let cwd: String
+    let lastActivity: Date
+    let archived: Bool
+    var project: String { (cwd as NSString).lastPathComponent }
+}
+
+/// Fields tied to the source account: its connectors, remote-control bridge and armed scheduled work.
+let accountBoundThreadKeys = ["remoteMcpServersConfig", "bridgeSessionIds", "armedWorkAtQuit"]
+
+/// The <account>/<org> folder holding a profile's threads, preferring its last signed-in account.
+func threadsDir(_ profile: URL) -> URL? {
+    let root = profile.appendingPathComponent("claude-code-sessions")
+    let acctPref = ((try? Data(contentsOf: profile.appendingPathComponent("config.json")))
+        .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })?["lastKnownAccountUuid"] as? String
+    let accts = ((try? fm.contentsOfDirectory(atPath: root.path)) ?? []).filter { !$0.hasPrefix(".") }
+    guard let acct = accts.first(where: { $0 == acctPref }) ?? accts.first else { return nil }
+    let acctDir = root.appendingPathComponent(acct)
+    let orgs = ((try? fm.contentsOfDirectory(atPath: acctDir.path)) ?? []).filter { !$0.hasPrefix(".") }
+    return orgs.first.map { acctDir.appendingPathComponent($0) }
+}
+
+func listThreads(_ profile: String) -> [ThreadInfo] {
+    guard let dir = threadsDir(profileDir(profile)) else { return [] }
+    let files = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+        .filter { $0.hasPrefix("local_") && $0.hasSuffix(".json") }
+    return files.compactMap { name -> ThreadInfo? in
+        let url = dir.appendingPathComponent(name)
+        guard let d = try? Data(contentsOf: url),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let cwd = j["cwd"] as? String,
+              !cwd.contains("/Library/Application Support/") // scratch threads inside the profile folder
+        else { return nil }
+        let t = (j["lastActivityAt"] as? Double) ?? (j["createdAt"] as? Double) ?? 0
+        return ThreadInfo(file: url, title: (j["title"] as? String) ?? "Untitled", cwd: cwd,
+                          lastActivity: Date(timeIntervalSince1970: t / 1000),
+                          archived: (j["isArchived"] as? Bool) ?? false)
+    }.sorted { $0.lastActivity > $1.lastActivity }
+}
+
+func copyThreadFiles(_ threads: [ThreadInfo], to profile: URL) throws -> (copied: Int, skipped: Int) {
+    guard let dest = threadsDir(profile) else {
+        throw err("That account hasn't used Claude Code yet. Switch to it, open the Code tab once, then copy.")
+    }
+    var copied = 0, skipped = 0
+    for t in threads {
+        let out = dest.appendingPathComponent(t.file.lastPathComponent)
+        if fm.fileExists(atPath: out.path) { skipped += 1; continue }
+        guard var j = try JSONSerialization.jsonObject(with: Data(contentsOf: t.file)) as? [String: Any] else { continue }
+        accountBoundThreadKeys.forEach { j.removeValue(forKey: $0) }
+        try JSONSerialization.data(withJSONObject: j).write(to: out, options: .atomic)
+        copied += 1
+    }
+    return (copied, skipped)
 }
 
 // MARK: - Formatting
@@ -596,6 +692,9 @@ struct Panel: View {
                 FooterButton(icon: "folder", help: "Show profiles folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([parkDir])
                 }
+                FooterButton(icon: "arrow.right.doc.on.clipboard", help: "Copy Claude Code threads between accounts") {
+                    CopyWindow.show(store)
+                }
                 Rectangle().fill(Color.stroke).frame(width: 1, height: 22)
                 if let b = store.busy {
                     ProgressView().controlSize(.small)
@@ -622,6 +721,124 @@ struct Panel: View {
         .frame(width: 480)
         .background(Color.bg)
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Copy threads window
+
+struct CopyThreadsView: View {
+    @ObservedObject var store: Store
+    @State private var from = ""
+    @State private var to = ""
+    @State private var threads: [ThreadInfo] = []
+    @State private var picked = Set<String>()
+    @State private var query = ""
+    @State private var showArchived = false
+    @State private var status: String?
+
+    var names: [String] { store.profiles.map(\.name) }
+    var visible: [ThreadInfo] {
+        threads.filter { (showArchived || !$0.archived)
+            && (query.isEmpty || "\($0.title) \($0.cwd)".localizedCaseInsensitiveContains(query)) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                picker("From", $from)
+                Image(systemName: "arrow.right").foregroundColor(.claude)
+                picker("To", $to)
+                Spacer()
+            }
+            HStack {
+                TextField("Search threads or projects", text: $query).textFieldStyle(.roundedBorder)
+                Toggle("Archived", isOn: $showArchived).toggleStyle(.checkbox)
+            }
+            HStack {
+                Button(allPicked ? "Select none" : "Select all") {
+                    if allPicked { visible.forEach { picked.remove($0.id) } } else { visible.forEach { picked.insert($0.id) } }
+                }.buttonStyle(.link)
+                Spacer()
+                Text("\(picked.count) selected · \(visible.count) shown").font(.system(size: 11)).foregroundColor(.sub)
+            }
+            List(visible) { t in
+                HStack(spacing: 10) {
+                    Toggle("", isOn: Binding(get: { picked.contains(t.id) },
+                                             set: { on in if on { picked.insert(t.id) } else { picked.remove(t.id) } }))
+                        .toggleStyle(.checkbox).labelsHidden()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(t.title).font(.system(size: 13, weight: .semibold)).foregroundColor(.txt).lineLimit(1)
+                        Text(t.cwd.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                            .font(.system(size: 11)).foregroundColor(.sub).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    Text(t.project).font(.system(size: 10, weight: .bold)).padding(.horizontal, 6).padding(.vertical, 3)
+                        .foregroundColor(.sub).background(RoundedRectangle(cornerRadius: 5).fill(Color.stroke))
+                    Text(ago(t.lastActivity)).font(.system(size: 11)).foregroundColor(.sub).frame(width: 60, alignment: .trailing)
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+                .onTapGesture { if picked.contains(t.id) { picked.remove(t.id) } else { picked.insert(t.id) } }
+            }
+            .listStyle(.inset(alternatesRowBackgrounds: false))
+            .overlay { if visible.isEmpty { Text(from.isEmpty ? "" : "No threads in \(from)").foregroundColor(.sub) } }
+            HStack {
+                if let b = store.busy {
+                    ProgressView().controlSize(.small); Text(b).foregroundColor(.claude)
+                } else if let s = status {
+                    Text(s).font(.system(size: 12)).foregroundColor(s.hasPrefix("Copied") ? .good : .warn).lineLimit(2)
+                }
+                Spacer()
+                Button("Copy \(picked.count) to \(to)") {
+                    let sel = threads.filter { picked.contains($0.id) }
+                    Task {
+                        status = await store.copyThreads(sel, to: to)
+                        if status?.hasPrefix("Copied") == true { picked.removeAll() }
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(picked.isEmpty || from == to || store.busy != nil)
+            }
+            if to == store.current && store.claudeRunning {
+                Text("Claude will restart so \(to) picks up the copied threads.").font(.system(size: 11)).foregroundColor(.sub)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 620, minHeight: 520)
+        .background(Color.bg)
+        .preferredColorScheme(.dark)
+        .onAppear {
+            to = store.current
+            from = names.filter { $0 != to }.max { listThreads($0).count < listThreads($1).count } ?? to
+            load()
+        }
+        .onChange(of: from) { _ in load() }
+    }
+
+    var allPicked: Bool { !visible.isEmpty && visible.allSatisfy { picked.contains($0.id) } }
+
+    func load() { threads = listThreads(from); picked.removeAll(); status = nil }
+
+    func picker(_ label: String, _ sel: Binding<String>) -> some View {
+        Picker(label, selection: sel) { ForEach(names, id: \.self) { Text($0).tag($0) } }.frame(width: 190)
+    }
+}
+
+enum CopyWindow {
+    static var window: NSWindow?
+    @MainActor static func show(_ store: Store) {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 580),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            w.title = "Copy Claude Code Threads"
+            w.isReleasedWhenClosed = false
+            w.appearance = NSAppearance(named: .darkAqua)
+            w.contentViewController = NSHostingController(rootView: CopyThreadsView(store: store))
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
     }
 }
 
@@ -685,7 +902,9 @@ if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLi
         let store = demo ? Store(demo: true) : Store()
         Task { @MainActor in
             if !demo { await store.refresh() }
-            let r = ImageRenderer(content: Panel(store: store))
+            let r = CommandLine.arguments.contains("--copy")
+                ? ImageRenderer(content: AnyView(CopyThreadsView(store: store).frame(width: 680, height: 580)))
+                : ImageRenderer(content: AnyView(Panel(store: store)))
             r.scale = 2
             if let cg = r.cgImage {
                 try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?.write(to: out)

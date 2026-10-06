@@ -10,6 +10,7 @@ A tiny macOS menu bar app for people with more than one Claude account (say, Per
 - **See your limits at a glance.** For every account: 5-hour session left, weekly limit left, and when each one resets.
 - **Menu bar readout.** The icon shows the active account and its remaining session, e.g. `✦ P · 72%`.
 - **Add as many accounts as you like.** Click "Add another account", give it a name, switch to it and sign in.
+- **Bring your Claude Code threads along.** The copy button in the footer opens a window where you pick threads from one account and copy them to another, so you can keep working on a project after switching. Full history comes with them.
 - **Open at login.** Toggle it with the sunrise button in the footer.
 
 ## Install
@@ -54,6 +55,12 @@ Switching quits Claude, renames the folders (instant, even for many GB) and reop
 
 Safety rails: if Claude doesn't quit within 15 seconds, nothing is moved. It never overwrites a parked profile that has data in it.
 
+## How copying threads works
+
+Each Claude Code thread in the desktop app is a small JSON file in `claude-code-sessions/<account>/<org>/` inside the profile. The conversation itself lives in `~/.claude/projects`, which every account shares, so copying that JSON file is enough for the other account to resume the thread. A few account-specific fields (connectors, remote-control links, armed scheduled tasks) are stripped on copy. Threads that already exist in the destination are skipped, and nothing is deleted from the source.
+
+If the destination is the active account, Claude restarts so the new threads show up. The destination account must have opened the Code tab at least once.
+
 ## How usage works
 
 Claude Desktop stores each account's login token in that account's `config.json`, encrypted with a key in your macOS keychain. Claude Switcher decrypts the token locally and calls the same usage endpoint the Claude apps use (`api.anthropic.com/api/oauth/usage`). Tokens never leave your Mac except in requests to `api.anthropic.com`. Usage refreshes when you open the panel and every 5 minutes.
@@ -63,7 +70,7 @@ Claude Desktop stores each account's login token in that account's `config.json`
 - **Unofficial.** This isn't made by or affiliated with Anthropic. The usage endpoint is undocumented and could change; if it does, cards fall back to the last known numbers ("as of 2h ago").
 - **Desktop app only.** The `claude` CLI has its own login and isn't switched.
 - **Switching quits Claude.** Let running sessions finish first.
-- Claude Code transcripts live in the shared `~/.claude/projects`. Only the desktop thread lists are split per account.
+- Claude Code transcripts live in the shared `~/.claude/projects`. Only the desktop thread lists are split per account, which is what makes copying threads possible.
 - The app is ad-hoc signed, so after rebuilding you'll get the keychain prompt again.
 
 ## Uninstall
