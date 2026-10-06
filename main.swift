@@ -639,7 +639,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.behavior = .transient
             popover.animates = true
             popover.appearance = NSAppearance(named: .darkAqua)
-            popover.contentViewController = NSHostingController(rootView: Panel(store: store))
+            let host = NSHostingController(rootView: Panel(store: store))
+            // Let the popover track the SwiftUI size; otherwise it's positioned at its initial
+            // (too small) size and the grown content spills up past the menu bar.
+            host.sizingOptions = [.preferredContentSize]
+            popover.contentViewController = host
             item.button?.target = self
             item.button?.action = #selector(toggle)
             updateTitle()
@@ -661,6 +665,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown { popover.performClose(nil); return }
             guard let b = item.button else { return }
             Task { await store.refresh() }
+            if let v = popover.contentViewController?.view {
+                v.layoutSubtreeIfNeeded()
+                popover.contentSize = v.fittingSize
+            }
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
             NSApp.activate(ignoringOtherApps: true)

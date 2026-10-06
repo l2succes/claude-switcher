@@ -14,7 +14,18 @@ A tiny macOS menu bar app for people with more than one Claude account (say, Per
 
 ## Install
 
-Requires macOS 13+ and the Xcode Command Line Tools (`xcode-select --install`).
+Requires macOS 13+ (Apple Silicon or Intel).
+
+### Download
+
+1. Grab **ClaudeSwitcher.dmg** from the [latest release](https://github.com/l2succes/claude-switcher/releases/latest).
+2. Open it and drag **Claude Switcher** into **Applications**.
+3. Open it. The app isn't notarized by Apple, so macOS will block the first launch. Go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (Or run `xattr -dr com.apple.quarantine "/Applications/Claude Switcher.app"` in Terminal.)
+4. Click the sunrise button in the footer if you want it to open at login.
+
+### Build from source
+
+Needs the Xcode Command Line Tools (`xcode-select --install`).
 
 ```sh
 git clone https://github.com/l2succes/claude-switcher.git
@@ -22,7 +33,7 @@ cd claude-switcher
 ./build.sh install
 ```
 
-That builds the app, copies it to `/Applications`, adds it to Login Items and launches it. Use `./build.sh` on its own to just build it in place.
+That builds the app, copies it to `/Applications`, adds it to Login Items and launches it. Use `./build.sh` on its own to just build it in place, or `./build.sh dmg` to package a universal `dist/ClaudeSwitcher.dmg`.
 
 The first time it reads usage, macOS asks whether **Claude Switcher** may access **Claude Safe Storage** in your keychain. Click **Always Allow** (see [How usage works](#how-usage-works) for why).
 
