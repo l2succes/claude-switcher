@@ -231,6 +231,8 @@ final class Store: ObservableObject {
     @Published var lastRefresh: Date?
     @Published var banner: String?
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var cliProfile: String?     // profile the terminal `claude` is logged in as
+    @Published var cliEmail: String?
     var onChange: (() -> Void)?
 
     /// Fake accounts for README screenshots — touches no files, keychain or network.
@@ -243,6 +245,8 @@ final class Store: ObservableObject {
                      weeklyOpus: nil, extraEnabled: false, fetchedAt: now)
         }
         current = "Personal"
+        cliProfile = "Personal"
+        cliEmail = "ada@lovelace.dev"
         claudeRunning = true
         lastRefresh = now
         profiles = [
@@ -307,6 +311,7 @@ final class Store: ObservableObject {
                 }
             }
         }
+        refreshCLI()
         lastRefresh = Date()
         onChange?()
     }
@@ -345,10 +350,63 @@ final class Store: ObservableObject {
             banner = "Switch failed: \(error.localizedDescription)"
             return
         }
+        busy = "Moving terminal login…"
+        do { try await switchCLI(to: target) } catch { banner = "Terminal not switched: \(error.localizedDescription)" }
         busy = "Opening Claude…"
         await launchClaude()
         reloadList()
         await refresh()
+    }
+
+    func refreshCLI() {
+        cliEmail = liveOauthAccount()?["emailAddress"] as? String
+        if let saved = (try? String(contentsOf: cliCurrentFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !saved.isEmpty {
+            cliProfile = saved
+        } else {
+            // First run: work out which profile the terminal is on from its email.
+            cliProfile = profiles.first { $0.snapshot?.email != nil && $0.snapshot?.email == cliEmail }?.name
+                ?? (cliEmail == nil ? current : nil)
+            if let p = cliProfile { try? p.write(to: cliCurrentFile, atomically: true, encoding: .utf8) }
+        }
+    }
+
+    /// Parks the terminal's Claude login under its current profile and restores `target`'s
+    /// (or logs the terminal out if `target` has none yet, so `claude /login` can set it up).
+    func switchCLI(to target: String) async throws {
+        refreshCLI()
+        guard let cur = cliProfile else {
+            throw err("Couldn't tell which profile the terminal is logged in as (\(cliEmail ?? "unknown")).")
+        }
+        guard cur != target else { return }
+        var live = readLiveCLICreds() ?? [:]
+        if let oauth = live["claudeAiOauth"] as? [String: Any] {
+            // A still-running `claude` can re-save its old login after a switch. Make sure the
+            // login we're about to park really belongs to `cur` before filing it there.
+            let expected = profiles.first { $0.name == cur }?.snapshot?.email
+            if let tok = oauth["accessToken"] as? String, let expected,
+               let actual = (try? await getJSON("profile", tok))
+                   .flatMap({ ($0["account"] as? [String: Any])?["email"] as? String }),
+               actual != expected {
+                throw err("The terminal is logged in as \(actual), not \(cur) (\(expected)). Quit running `claude` sessions and try again.")
+            }
+            var parked: [String: Any] = ["claudeAiOauth": oauth]
+            parked["oauthAccount"] = liveOauthAccount()
+            try writeKeychain(service: switcherService, account: "cli-\(cur)", json: parked)
+        }
+        let restore = readKeychain(service: switcherService, account: "cli-\(target)")
+        live["claudeAiOauth"] = restore?["claudeAiOauth"]
+        try writeKeychain(service: cliService, account: NSUserName(), json: live)
+        try setLiveOauthAccount(restore?["oauthAccount"] as? [String: Any])
+        try target.write(to: cliCurrentFile, atomically: true, encoding: .utf8)
+        refreshCLI()
+    }
+
+    func moveTerminal(to target: String) async {
+        guard busy == nil else { return }
+        busy = "Moving terminal login…"
+        do { try await switchCLI(to: target) } catch { banner = "Terminal not switched: \(error.localizedDescription)" }
+        busy = nil
     }
 
     /// Copies threads into another profile. If that profile is live and Claude is running,
@@ -386,6 +444,66 @@ func launchClaude() async {
     if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
         _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: .init())
     }
+}
+
+// MARK: - Terminal (Claude Code CLI) login
+//
+// The CLI keeps its login in the keychain item "Claude Code-credentials" (key `claudeAiOauth`,
+// next to MCP server logins under `mcpOAuth`, which stay shared) and the account details in
+// ~/.claude.json `oauthAccount`. Parked logins go in our own keychain item, one per profile.
+// Everything goes through /usr/bin/security, which is how the CLI itself reads the item.
+
+let cliService = "Claude Code-credentials"
+let switcherService = "Claude Switcher"
+let cliCurrentFile = parkDir.appendingPathComponent(".cli-current")
+let claudeJSON = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude.json")
+
+@discardableResult
+func security(_ args: [String], stdin: String? = nil) -> (status: Int32, out: String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = args
+    let out = Pipe(), inp = Pipe()
+    p.standardOutput = out
+    p.standardError = Pipe()
+    if stdin != nil { p.standardInput = inp }
+    do { try p.run() } catch { return (-1, "") }
+    if let stdin { inp.fileHandleForWriting.write(Data(stdin.utf8)); try? inp.fileHandleForWriting.close() }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+func readKeychain(service: String, account: String) -> [String: Any]? {
+    let r = security(["find-generic-password", "-s", service, "-a", account, "-w"])
+    guard r.status == 0 else { return nil }
+    return try? JSONSerialization.jsonObject(with: Data(r.out.trimmingCharacters(in: .newlines).utf8)) as? [String: Any]
+}
+
+func writeKeychain(service: String, account: String, json: [String: Any]) throws {
+    let hex = try JSONSerialization.data(withJSONObject: json).map { String(format: "%02x", $0) }.joined()
+    let acct = account.replacingOccurrences(of: "\"", with: "")
+    // -i reads the command from stdin so the secret never shows up in `ps`.
+    let r = security(["-i"], stdin: "add-generic-password -U -a \"\(acct)\" -s \"\(service)\" -X \(hex)\n")
+    guard r.status == 0, readKeychain(service: service, account: account) != nil else {
+        throw err("Couldn't save the login to the keychain (\(service)).")
+    }
+}
+
+func readLiveCLICreds() -> [String: Any]? { readKeychain(service: cliService, account: NSUserName()) }
+
+func liveOauthAccount() -> [String: Any]? {
+    ((try? Data(contentsOf: claudeJSON)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })?["oauthAccount"] as? [String: Any]
+}
+
+func setLiveOauthAccount(_ acct: [String: Any]?) throws {
+    guard var j = try JSONSerialization.jsonObject(with: Data(contentsOf: claudeJSON)) as? [String: Any] else {
+        throw err("Couldn't read ~/.claude.json")
+    }
+    j["oauthAccount"] = acct
+    try JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .withoutEscapingSlashes])
+        .write(to: claudeJSON, options: .atomic)
+    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: claudeJSON.path)
 }
 
 // MARK: - Claude Code threads
@@ -536,6 +654,34 @@ struct Header: View {
     }
 }
 
+struct TerminalStrip: View {
+    @ObservedObject var store: Store
+    @State private var hover = false
+    var body: some View {
+        let mismatch = store.cliProfile != store.current
+        HStack(spacing: 10) {
+            Image(systemName: "terminal").font(.system(size: 13, weight: .semibold)).foregroundColor(.claude)
+            Text("Terminal").font(.system(size: 12, weight: .bold)).foregroundColor(.txt)
+            Text(store.cliEmail.map { "\(store.cliProfile ?? "?")  ·  \($0)" }
+                 ?? "\(store.cliProfile ?? "?")  ·  not logged in, run claude /login")
+                .font(.system(size: 11.5)).foregroundColor(.sub).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 6)
+            if mismatch {
+                Button { Task { await store.moveTerminal(to: store.current) } } label: {
+                    Text("MOVE TO \(store.current.uppercased())").font(.system(size: 10, weight: .heavy)).tracking(0.5)
+                        .padding(.horizontal, 9).padding(.vertical, 5)
+                        .foregroundColor(.white)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(hover ? Color.claude.opacity(0.85) : .claude))
+                }.buttonStyle(.plain).disabled(store.busy != nil).onHover { hover = $0 }
+            } else {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.good).help("Terminal matches the desktop app")
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.card))
+    }
+}
+
 struct ProfileCard: View {
     let p: Profile
     let active: Bool
@@ -675,6 +821,7 @@ struct Panel: View {
     var body: some View {
         VStack(spacing: 12) {
             Header(store: store)
+            TerminalStrip(store: store)
             if let b = store.banner {
                 Label(b, systemImage: "exclamationmark.triangle.fill").font(.system(size: 11.5))
                     .foregroundColor(.warn).frame(maxWidth: .infinity, alignment: .leading)
